@@ -663,11 +663,11 @@ int smbcli_ctemp(struct smbcli_tree *tree, const char *path, char **tmp_path)
 	open_parms.ctemp.in.write_time = 0;
 
 	status = smb_raw_open(tree, mem_ctx, &open_parms);
-	if (tmp_path) {
-		*tmp_path = strdup(open_parms.ctemp.out.name);
-	}
 	talloc_free(mem_ctx);
 	if (NT_STATUS_IS_OK(status)) {
+		if (tmp_path) {
+			*tmp_path = strdup(open_parms.ctemp.out.name);
+		}
 		return open_parms.ctemp.out.file.fnum;
 	}
 	return -1;
