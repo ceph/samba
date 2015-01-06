@@ -147,6 +147,7 @@ static void cephwrap_disconnect(struct vfs_handle_struct *handle)
 	ceph_shutdown(cmount);
 
 	cmount = NULL;  /* Make it safe */
+	handle->data = NULL;
 }
 
 /* Disk operations */
@@ -217,6 +218,10 @@ static int cephwrap_statvfs(struct vfs_handle_struct *handle,  const char *path,
 {
 	struct statvfs statvfs_buf;
 	int ret;
+
+	if (!handle->data) {
+		WRAP_RETURN(-ENOTCONN);
+	}
 
 	ret = ceph_statfs(handle->data, path, &statvfs_buf);
 	if (ret < 0) {
@@ -721,6 +726,10 @@ static int cephwrap_chdir(struct vfs_handle_struct *handle,  const char *path)
 {
 	int result = -1;
 	DEBUG(10, ("[CEPH] chdir(%p, %s)\n", handle, path));
+
+	if (!handle->data) {
+		WRAP_RETURN(-ENOTCONN);
+	}
 	/*
 	 * If the path is just / use chdir because Ceph is below / and
 	 * cannot deal with changing directory above its mount point
@@ -735,7 +744,11 @@ static int cephwrap_chdir(struct vfs_handle_struct *handle,  const char *path)
 
 static char *cephwrap_getwd(struct vfs_handle_struct *handle)
 {
-	const char *cwd = ceph_getcwd(handle->data);
+	const char *cwd;
+	if (handle->data)
+		cwd = ceph_getcwd(handle->data);
+	else
+		cwd = "/";
 	DEBUG(10, ("[CEPH] getwd(%p) = %s\n", handle, cwd));
 	return strdup(cwd);
 }
