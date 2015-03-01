@@ -1042,7 +1042,49 @@ static const char *cephwrap_connectpath(struct vfs_handle_struct *handle,
  Extended attribute operations.
 *****************************************************************/
 
-static ssize_t cephwrap_getxattr(struct vfs_handle_struct *handle,const char *path, const char *name, void *value, size_t size)
+static int __ceph_fgetxattr(struct vfs_handle_struct *handle,
+			    struct files_struct *fsp,
+			    const char *name, void *value, size_t size)
+{
+#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0,94,0)
+	return ceph_fgetxattr(handle->data, fsp->fh->fd, name, value, size);
+#else
+	return ceph_getxattr(handle->data, fsp->fsp_name->base_name, name, value, size);
+#endif
+}
+
+static int __ceph_fsetxattr(struct vfs_handle_struct *handle,
+			    struct files_struct *fsp,
+			    const char *name, const void *value, size_t size, int flags)
+{
+#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0,94,0)
+	return ceph_fsetxattr(handle->data, fsp->fh->fd, name, value, size, flags);
+#else
+	return ceph_setxattr(handle->data, fsp->fsp_name->base_name, name, value, size, flags);
+#endif
+}
+
+static int __ceph_fremovexattr(struct vfs_handle_struct *handle,
+				struct files_struct *fsp, const char *name)
+{
+#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0,94,0)
+	return ceph_fremovexattr(handle->data, fsp->fh->fd, name);
+#else
+	return ceph_removexattr(handle->data, fsp->fsp_name->base_name, name);
+#endif
+}
+
+static int __ceph_flistxattr(struct vfs_handle_struct *handle,
+			     struct files_struct *fsp, char *list, size_t size)
+{
+#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0,94,0)
+	return ceph_flistxattr(handle->data, fsp->fh->fd, list, size);
+#else
+	return ceph_listxattr(handle->data, fsp->fsp_name->base_name, list, size);
+#endif
+}
+
+static ssize_t cephwrap_getxattr(struct vfs_handle_struct *handle, const char *path, const char *name, void *value, size_t size)
 {
 	int ret;
 	DEBUG(10, ("[CEPH] getxattr(%p, %s, %s, %p, %llu)\n", handle, path, name, value, llu(size)));
@@ -1059,11 +1101,7 @@ static ssize_t cephwrap_fgetxattr(struct vfs_handle_struct *handle, struct files
 {
 	int ret;
 	DEBUG(10, ("[CEPH] fgetxattr(%p, %p, %s, %p, %llu)\n", handle, fsp, name, value, llu(size)));
-#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0, 94, 0)
-	ret = ceph_fgetxattr(handle->data, fsp->fh->fd, name, value, size);
-#else
-	ret = ceph_getxattr(handle->data, fsp->fsp_name->base_name, name, value, size);
-#endif
+	ret = __ceph_fgetxattr(handle, fsp, name, value, size);
 	DEBUG(10, ("[CEPH] fgetxattr(...) = %d\n", ret));
 	if (ret < 0) {
 		WRAP_RETURN(ret);
@@ -1104,11 +1142,7 @@ static ssize_t cephwrap_flistxattr(struct vfs_handle_struct *handle, struct file
 {
 	int ret;
 	DEBUG(10, ("[CEPH] flistxattr(%p, %p, %s, %llu)\n", handle, fsp, list, llu(size)));
-#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0, 94, 0)
-	ret = ceph_flistxattr(handle->data, fsp->fh->fd, list, size);
-#else
-	ret = ceph_listxattr(handle->data, fsp->fsp_name->base_name, list, size);
-#endif
+	ret = __ceph_flistxattr(handle, fsp, list, size);
 	DEBUG(10, ("[CEPH] flistxattr(...) = %d\n", ret));
 	if (ret < 0) {
 		WRAP_RETURN(ret);
@@ -1130,11 +1164,7 @@ static int cephwrap_fremovexattr(struct vfs_handle_struct *handle, struct files_
 {
 	int ret;
 	DEBUG(10, ("[CEPH] fremovexattr(%p, %p, %s)\n", handle, fsp, name));
-#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0, 94, 0)
-	ret = ceph_fremovexattr(handle->data, fsp->fh->fd, name);
-#else
-	ret = ceph_removexattr(handle->data, fsp->fsp_name->base_name, name);
-#endif
+	ret = __ceph_fremovexattr(handle, fsp, name);
 	DEBUG(10, ("[CEPH] fremovexattr(...) = %d\n", ret));
 	WRAP_RETURN(ret);
 }
@@ -1152,12 +1182,7 @@ static int cephwrap_fsetxattr(struct vfs_handle_struct *handle, struct files_str
 {
 	int ret;
 	DEBUG(10, ("[CEPH] fsetxattr(%p, %p, %s, %p, %llu, %d)\n", handle, fsp, name, value, llu(size), flags));
-#if LIBCEPHFS_VERSION_CODE >= LIBCEPHFS_VERSION(0, 94, 0)
-	ret = ceph_fsetxattr(handle->data, fsp->fh->fd,
-			     name, value, size, flags);
-#else
-	ret = ceph_setxattr(handle->data, fsp->fsp_name->base_name, name, value, size, flags);
-#endif
+	ret = __ceph_fsetxattr(handle, fsp, name, value, size, flags);
 	DEBUG(10, ("[CEPH] fsetxattr(...) = %d\n", ret));
 	WRAP_RETURN(ret);
 }
@@ -1188,21 +1213,440 @@ static int cephwrap_set_offline(struct vfs_handle_struct *handle,
 	return -1;
 }
 
+
+/*
+  Following ACL codes are copied from vfs_glusterfs.c
+
+  CEPH ACL Format (the same as posix xattr ACL format):
+
+  Size = 4 (header) + N * 8 (entry)
+
+  Offset  Size    Field (Little Endian)
+  -------------------------------------
+  0-3     4-byte  Version
+
+  4-5     2-byte  Entry-1 tag
+  6-7     2-byte  Entry-1 perm
+  8-11    4-byte  Entry-1 id
+
+  12-13   2-byte  Entry-2 tag
+  14-15   2-byte  Entry-2 perm
+  16-19   4-byte  Entry-2 id
+
+  ...
+ */
+
+/* header version */
+#define CEPH_ACL_VERSION 2
+
+/* perm bits */
+#define CEPH_ACL_READ    0x04
+#define CEPH_ACL_WRITE   0x02
+#define CEPH_ACL_EXECUTE 0x01
+
+/* tag values */
+#define CEPH_ACL_USER_OBJ       0x01
+#define CEPH_ACL_USER           0x02
+#define CEPH_ACL_GROUP_OBJ      0x04
+#define CEPH_ACL_GROUP          0x08
+#define CEPH_ACL_MASK           0x10
+#define CEPH_ACL_OTHER          0x20
+
+#define CEPH_ACL_UNDEFINED_ID  (-1)
+
+#define CEPH_ACL_HEADER_SIZE    4
+#define CEPH_ACL_ENTRY_SIZE     8
+
+#define CEPH_ACL_SIZE(n)  (CEPH_ACL_HEADER_SIZE + (n * CEPH_ACL_ENTRY_SIZE))
+
+static SMB_ACL_T mode_to_smb_acls(const struct stat *mode, TALLOC_CTX *mem_ctx)
+{
+	struct smb_acl_t *result;
+	int count;
+
+	count = 3;
+	result = sys_acl_init(mem_ctx);
+	if (!result) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	result->acl = talloc_array(result, struct smb_acl_entry, count);
+	if (!result->acl) {
+		errno = ENOMEM;
+		talloc_free(result);
+		return NULL;
+	}
+
+	result->count = count;
+
+	result->acl[0].a_type = SMB_ACL_USER_OBJ;
+	result->acl[0].a_perm = (mode->st_mode & S_IRWXU) >> 6;;
+
+	result->acl[1].a_type = SMB_ACL_GROUP_OBJ;
+	result->acl[1].a_perm = (mode->st_mode & S_IRWXG) >> 3;;
+
+	result->acl[2].a_type = SMB_ACL_OTHER;
+	result->acl[2].a_perm = mode->st_mode & S_IRWXO;;
+
+	return result;
+}
+
+static SMB_ACL_T ceph_to_smb_acl(const char *buf, size_t xattr_size,
+				 TALLOC_CTX *mem_ctx)
+{
+	int count;
+	size_t size;
+	struct smb_acl_entry *smb_ace;
+	struct smb_acl_t *result;
+	int i;
+	int offset;
+	uint16_t tag;
+	uint16_t perm;
+	uint32_t id;
+
+	size = xattr_size;
+
+	if (size < CEPH_ACL_HEADER_SIZE) {
+		/* ACL should be at least as big as the header (4 bytes) */
+		errno = EINVAL;
+		return NULL;
+	}
+
+	size -= CEPH_ACL_HEADER_SIZE; /* size of header = 4 bytes */
+
+	if (size % CEPH_ACL_ENTRY_SIZE) {
+		/* Size of entries must strictly be a multiple of
+		   size of an ACE (8 bytes)
+		*/
+		errno = EINVAL;
+		return NULL;
+	}
+
+	count = size / CEPH_ACL_ENTRY_SIZE;
+
+	/* Version is the first 4 bytes of the ACL */
+	if (IVAL(buf, 0) != CEPH_ACL_VERSION) {
+		DEBUG(0, ("Unknown ceph ACL version: %d\n",
+			  IVAL(buf, 0)));
+		return NULL;
+	}
+	offset = CEPH_ACL_HEADER_SIZE;
+
+	result = sys_acl_init(mem_ctx);
+	if (!result) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	result->acl = talloc_array(result, struct smb_acl_entry, count);
+	if (!result->acl) {
+		errno = ENOMEM;
+		talloc_free(result);
+		return NULL;
+	}
+
+	result->count = count;
+
+	smb_ace = result->acl;
+
+	for (i = 0; i < count; i++) {
+		/* TAG is the first 2 bytes of an entry */
+		tag = SVAL(buf, offset);
+		offset += 2;
+
+		/* PERM is the next 2 bytes of an entry */
+		perm = SVAL(buf, offset);
+		offset += 2;
+
+		/* ID is the last 4 bytes of an entry */
+		id = IVAL(buf, offset);
+		offset += 4;
+
+		switch(tag) {
+		case CEPH_ACL_USER:
+			smb_ace->a_type = SMB_ACL_USER;
+			break;
+		case CEPH_ACL_USER_OBJ:
+			smb_ace->a_type = SMB_ACL_USER_OBJ;
+			break;
+		case CEPH_ACL_GROUP:
+			smb_ace->a_type = SMB_ACL_GROUP;
+			break;
+		case CEPH_ACL_GROUP_OBJ:
+			smb_ace->a_type = SMB_ACL_GROUP_OBJ;
+			break;
+		case CEPH_ACL_OTHER:
+			smb_ace->a_type = SMB_ACL_OTHER;
+			break;
+		case CEPH_ACL_MASK:
+			smb_ace->a_type = SMB_ACL_MASK;
+			break;
+		default:
+			DEBUG(0, ("unknown tag type %d\n", (unsigned int) tag));
+			return NULL;
+		}
+
+
+		switch(smb_ace->a_type) {
+		case SMB_ACL_USER:
+			smb_ace->info.user.uid = id;
+			break;
+		case SMB_ACL_GROUP:
+			smb_ace->info.group.gid = id;
+			break;
+		default:
+			break;
+		}
+
+		smb_ace->a_perm = 0;
+		smb_ace->a_perm |=
+			((perm & CEPH_ACL_READ) ? SMB_ACL_READ : 0);
+		smb_ace->a_perm |=
+			((perm & CEPH_ACL_WRITE) ? SMB_ACL_WRITE : 0);
+		smb_ace->a_perm |=
+			((perm & CEPH_ACL_EXECUTE) ? SMB_ACL_EXECUTE : 0);
+
+		smb_ace++;
+	}
+
+	return result;
+}
+
+
+static int ceph_ace_cmp(const void *left, const void *right)
+{
+	int ret = 0;
+	uint16_t tag_left, tag_right;
+	uint32_t id_left, id_right;
+
+	/*
+	  Sorting precedence:
+	   - Smaller TAG values must be earlier.
+	   - Within same TAG, smaller identifiers must be earlier, E.g:
+	     UID 0 entry must be earlier than UID 200
+	     GID 17 entry must be earlier than GID 19
+	*/
+
+	/* TAG is the first element in the entry */
+	tag_left = SVAL(left, 0);
+	tag_right = SVAL(right, 0);
+
+	ret = (tag_left - tag_right);
+	if (!ret) {
+		/* ID is the third element in the entry, after two short
+		   integers (tag and perm), i.e at offset 4.
+		*/
+		id_left = IVAL(left, 4);
+		id_right = IVAL(right, 4);
+		ret = id_left - id_right;
+	}
+
+	return ret;
+}
+
+
+static int smb_to_ceph_acl(SMB_ACL_T theacl, char *buf, size_t len)
+{
+	ssize_t size;
+	struct smb_acl_entry *smb_ace;
+	int i;
+	int count;
+	uint16_t tag;
+	uint16_t perm;
+	uint32_t id;
+	int offset;
+
+	count = theacl->count;
+
+	size = CEPH_ACL_HEADER_SIZE + (count * CEPH_ACL_ENTRY_SIZE);
+	if (!buf) {
+		return size;
+	}
+	if (len < size) {
+		return -ERANGE;
+	}
+	smb_ace = theacl->acl;
+
+	/* Version is the first 4 bytes of the ACL */
+	SIVAL(buf, 0, CEPH_ACL_VERSION);
+	offset = CEPH_ACL_HEADER_SIZE;
+
+	for (i = 0; i < count; i++) {
+		/* Calculate tag */
+		switch(smb_ace->a_type) {
+		case SMB_ACL_USER:
+			tag = CEPH_ACL_USER;
+			break;
+		case SMB_ACL_USER_OBJ:
+			tag = CEPH_ACL_USER_OBJ;
+			break;
+		case SMB_ACL_GROUP:
+			tag = CEPH_ACL_GROUP;
+			break;
+		case SMB_ACL_GROUP_OBJ:
+			tag = CEPH_ACL_GROUP_OBJ;
+			break;
+		case SMB_ACL_OTHER:
+			tag = CEPH_ACL_OTHER;
+			break;
+		case SMB_ACL_MASK:
+			tag = CEPH_ACL_MASK;
+			break;
+		default:
+			DEBUG(0, ("Unknown tag value %d\n",
+				  smb_ace->a_type));
+			return -EINVAL;
+		}
+
+
+		/* Calculate id */
+		switch(smb_ace->a_type) {
+		case SMB_ACL_USER:
+			id = smb_ace->info.user.uid;
+			break;
+		case SMB_ACL_GROUP:
+			id = smb_ace->info.group.gid;
+			break;
+		default:
+			id = CEPH_ACL_UNDEFINED_ID;
+			break;
+		}
+
+		/* Calculate perm */
+		perm = 0;
+		perm |= (smb_ace->a_perm & SMB_ACL_READ) ? CEPH_ACL_READ : 0;
+		perm |= (smb_ace->a_perm & SMB_ACL_WRITE) ?
+						CEPH_ACL_WRITE : 0;
+		perm |= (smb_ace->a_perm & SMB_ACL_EXECUTE) ?
+						CEPH_ACL_EXECUTE : 0;
+
+		/* TAG is the first 2 bytes of an entry */
+		SSVAL(buf, offset, tag);
+		offset += 2;
+
+		/* PERM is the next 2 bytes of an entry */
+		SSVAL(buf, offset, perm);
+		offset += 2;
+
+		/* ID is the last 4 bytes of an entry */
+		SIVAL(buf, offset, id);
+		offset += 4;
+
+		smb_ace++;
+	}
+
+	/* Skip the header, sort @count number of 8-byte entries */
+	qsort(buf+CEPH_ACL_HEADER_SIZE, count, CEPH_ACL_ENTRY_SIZE,
+	      ceph_ace_cmp);
+
+	return size;
+}
+
+
 static SMB_ACL_T cephwrap_sys_acl_get_file(struct vfs_handle_struct *handle,
 					   const char *path_p,
-					   SMB_ACL_TYPE_T type,
+					   SMB_ACL_TYPE_T acltype,
 					   TALLOC_CTX *mem_ctx)
 {
-	errno = ENOTSUP;
-	return NULL;
+	struct smb_acl_t *result;
+	struct stat st;
+	ssize_t ret, size = CEPH_ACL_SIZE(20);
+	const char *key;
+	char *buf;
+
+	switch (acltype) {
+	case SMB_ACL_TYPE_ACCESS:
+		key = "system.posix_acl_access";
+		break;
+	case SMB_ACL_TYPE_DEFAULT:
+		key = "system.posix_acl_default";
+		break;
+	default:
+		errno = EINVAL;
+		return NULL;
+	}
+
+	buf = alloca(size);
+	if (!buf) {
+		return NULL;
+	}
+	ret = ceph_getxattr(handle->data, path_p, key, buf, size);
+	if (ret == -1 && errno == ERANGE) {
+		ret = ceph_getxattr(handle->data, path_p, key, 0, 0);
+		if (ret > 0) {
+			buf = alloca(ret);
+			if (!buf) {
+				return NULL;
+			}
+			ret = ceph_getxattr(handle->data, path_p, key,
+					buf, ret);
+		}
+	}
+
+	/* retrieving the ACL from the xattr has finally failed, do a
+	 * mode-to-acl mapping */
+
+	if (ret == -1 && errno == ENODATA) {
+		ret = ceph_stat(handle->data, path_p, &st);
+		if (ret == 0) {
+			result = mode_to_smb_acls(&st, mem_ctx);
+			return result;
+		}
+	}
+
+	if (ret <= 0) {
+		return NULL;
+	}
+	result = ceph_to_smb_acl(buf, ret, mem_ctx);
+	return result;
 }
 
 static SMB_ACL_T cephwrap_sys_acl_get_fd(struct vfs_handle_struct *handle,
 					 struct files_struct *fsp,
 					 TALLOC_CTX *mem_ctx)
 {
-	errno = ENOTSUP;
-	return NULL;
+	struct smb_acl_t *result;
+	struct stat st;
+	ssize_t ret, size = CEPH_ACL_SIZE(20);
+	char *buf;
+
+	buf = alloca(size);
+	if (!buf) {
+		return NULL;
+	}
+
+	ret = __ceph_fgetxattr(handle, fsp,
+			"system.posix_acl_access", buf, size);
+	if (ret == -1 && errno == ERANGE) {
+		ret = __ceph_fgetxattr(handle, fsp,
+				"system.posix_acl_access", 0, 0);
+		if (ret > 0) {
+			buf = alloca(ret);
+			if (!buf) {
+				return NULL;
+			}
+			ret = __ceph_fgetxattr(handle, fsp,
+					"system.posix_acl_access", buf, ret);
+		}
+	}
+
+	/* retrieving the ACL from the xattr has finally failed, do a
+	 * mode-to-acl mapping */
+
+	if (ret == -1 && errno == ENODATA) {
+		ret = ceph_fstat(handle->data, fsp->fh->fd, &st);
+		if (ret == 0) {
+			result = mode_to_smb_acls(&st, mem_ctx);
+			return result;
+		}
+	}
+
+	if (ret <= 0) {
+		return NULL;
+	}
+	result = ceph_to_smb_acl(buf, ret, mem_ctx);
+	return result;
 }
 
 static int cephwrap_sys_acl_set_file(struct vfs_handle_struct *handle,
@@ -1210,23 +1654,72 @@ static int cephwrap_sys_acl_set_file(struct vfs_handle_struct *handle,
 				     SMB_ACL_TYPE_T acltype,
 				     SMB_ACL_T theacl)
 {
-	errno = ENOTSUP;
-	return -1;
+	int ret;
+	const char *key;
+	char *buf;
+	ssize_t size;
+
+	DEBUG(10, ("[CEPH] sys_acl_set_file(%p, %s)\n", handle, name));
+
+	switch (acltype) {
+	case SMB_ACL_TYPE_ACCESS:
+		key = "system.posix_acl_access";
+		break;
+	case SMB_ACL_TYPE_DEFAULT:
+		key = "system.posix_acl_default";
+		break;
+	default:
+		ret = -EINVAL;
+		goto out;
+	}
+
+	size = smb_to_ceph_acl(theacl, 0, 0);
+	buf = alloca(size);
+
+	ret = smb_to_ceph_acl(theacl, buf, size);
+	if (ret < 0) {
+		goto out;
+	}
+	size = ret;
+	ret = ceph_setxattr(handle->data, name, key, buf, size, 0);
+out:
+	DEBUG(10, ("[CEPH] sys_acl_set_file(...) = %d\n", ret));
+	WRAP_RETURN(ret);
 }
 
 static int cephwrap_sys_acl_set_fd(struct vfs_handle_struct *handle,
 				   struct files_struct *fsp,
 				   SMB_ACL_T theacl)
 {
-	errno = ENOTSUP;
-	return -1;
+	int ret;
+	char *buf;
+	ssize_t size;
+
+	DEBUG(10, ("[CEPH] sys_acl_set_fd(%p, %p)\n", handle, fsp));
+
+	size = smb_to_ceph_acl(theacl, 0, 0);
+	buf = alloca(size);
+
+	ret = smb_to_ceph_acl(theacl, buf, size);
+	if (ret < 0) {
+		goto out;
+	}
+	size = ret;
+	ret = __ceph_fsetxattr(handle, fsp,
+			"system.posix_acl_access", buf, size, 0);
+out:
+	DEBUG(10, ("[CEPH] sys_acl_set_fd(...) = %d\n", ret));
+	WRAP_RETURN(ret);
 }
 
 static int cephwrap_sys_acl_delete_def_file(struct vfs_handle_struct *handle,
 					    const char *path)
 {
-	errno = ENOTSUP;
-	return -1;
+	int ret;
+	DEBUG(10, ("[CEPH] sys_acl_delete_def_file(%p, %s)\n", handle, path));
+	ret = ceph_removexattr(handle->data, path, "system.posix_acl_default");
+	DEBUG(10, ("[CEPH] sys_acl_delete_def_file(...) = %d\n", ret));
+	WRAP_RETURN(ret);
 }
 
 static struct vfs_fn_pointers ceph_fns = {
